@@ -1,0 +1,19 @@
+name: CI
+
+# Logic lives in JonomaIT/pipelines. Pull request: build (the unit tests run inside the build) and
+# scan the image. main: also push it to the platform registry, tagged with the commit SHA.
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write # OIDC with AWS (push role, main only)
+
+jobs:
+  image:
+    uses: JonomaIT/pipelines/.github/workflows/build-push.yml@v1.4.1

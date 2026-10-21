@@ -1,0 +1,7 @@
+.git
+.github
+deploy
+README.md
+LICENSE
+requirements.in
+**/__pycache__
