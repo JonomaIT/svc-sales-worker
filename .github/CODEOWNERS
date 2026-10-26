@@ -1,2 +1,7 @@
-# Owner of everything until there are teams (see Organização do GitHub).
-* @JoshuelNobre
+# Owners by path (ADR-014). The squad owns its code and its everyday values; what touches shared
+# data, the production size or the pipeline needs the platform team. Teams: gh-dev-vendas, gh-infra.
+# The last matching line wins, so those paths are the platform's alone.
+*                               @JonomaIT/gh-dev-vendas
+/deploy/data.hcl                @JonomaIT/gh-infra
+/deploy/env/production.tfvars   @JonomaIT/gh-infra
+/.github/                       @JonomaIT/gh-infra

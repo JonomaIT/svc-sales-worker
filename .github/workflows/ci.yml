@@ -16,4 +16,4 @@ permissions:
 
 jobs:
   image:
-    uses: JonomaIT/pipelines/.github/workflows/build-push.yml@v1.4.1
+    uses: JonomaIT/pipelines/.github/workflows/build-push.yml@v2.2.0
