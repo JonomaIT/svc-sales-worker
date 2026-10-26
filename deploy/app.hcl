@@ -8,6 +8,6 @@ health_check_path = "/health"
 env = {}
 
 slo = {
-  disponibilidade = 99.5
-  latencia_p95_ms = 1000 # from the sale's creation to PROCESSED, in the ACTIVE region
+  availability   = 99.5
+  latency_p95_ms = 1000 # from the sale's creation to PROCESSED, in the ACTIVE region
 }
