@@ -1,10 +1,22 @@
 """svc-sales-worker: processes the sales of the JonomaIT lab.
 
-It consumes its sales-processing queue, which receives every sale published by svc-sales-api in
-ANY region (fan-out across regions). It only consumes while its region is ACTIVE (ADR-012): a
-PASSIVE region leaves its copy of the messages in the queue, so after a failover (the platform
-flips the region state) it works through the backlog, and the idempotency table (global) skips
-what the other region already did. Nothing is lost while a region is down.
+Every sale is published by svc-sales-api on the sales-created topic of the region where it was
+created, and every region keeps a copy of it (fan-out across regions). The copy is split in two
+queues (standby, ADR-013):
+
+  QUEUE_SALES_PROCESSING          the sales created in this region
+  QUEUE_SALES_PROCESSING_STANDBY  the copies of the sales created in the other regions
+
+It only consumes while its region is ACTIVE (ADR-012); a PASSIVE region leaves both queues alone.
+An ACTIVE region always consumes its own sales, and the standby copies only while another region of
+the platform is out (not in active-regions). So:
+
+  active/passive   the ACTIVE region processes everything (its own queue and the standby copies)
+  active/active    each region processes what was born in it (processed_region = created_region);
+                   when one is taken out, the others work through its copies
+
+The idempotency table (global) skips what another region already did, so a failover never repeats
+a sale, and the copies kept in the queues mean nothing is lost while a region is down.
 
 For each sale, in this order, every step safe to repeat:
   1. already in the idempotency table?       -> duplicate, nothing to do
@@ -16,10 +28,11 @@ A crash in the middle only means a retry. A message that keeps failing (e.g. not
 dead-letter queue after max_receive_count attempts.
 
   GET /health -> 200 "ok" (container health)
-  GET /info   -> region, region state and counters
+  GET /info   -> region, region state, whether it takes the standby copies, and counters
 
-Everything arrives as environment variables: QUEUE_SALES_PROCESSING, TABLE_IDEMPOTENCY,
-BUCKET_RECEIPTS, TABLE_SALES (data runner, ADR-011), REGION_STATE_PARAMETER (platform), AWS_REGION.
+Everything arrives as environment variables: QUEUE_SALES_PROCESSING, QUEUE_SALES_PROCESSING_STANDBY
+(optional), TABLE_IDEMPOTENCY, BUCKET_RECEIPTS, TABLE_SALES (data runner, ADR-011),
+REGION_STATE_PARAMETER (platform; regions and active-regions are read next to it), AWS_REGION.
 """
 
 import json
@@ -46,28 +59,46 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-class RegionState:
-    """ACTIVE or PASSIVE (ADR-012), read from the platform's parameter, cached for a few seconds.
-    When it cannot be read the worker stays put: processing in two regions at once is the risk."""
+class Parameter:
+    """A platform parameter (region-state, regions, active-regions), cached for a few seconds.
+    UNKNOWN until it is read; when a read fails, the last value read is kept."""
 
     def __init__(self, ssm, name, ttl=15):
         self.ssm, self.name, self.ttl = ssm, name, ttl
-        self.value, self.read_at = "UNKNOWN", None
+        self.value, self.read_at, self.failing = "UNKNOWN", None, False
 
     def get(self):
         if self.read_at is None or time.monotonic() - self.read_at > self.ttl:
             try:
                 self.value = self.ssm.get_parameter(Name=self.name)["Parameter"]["Value"]
-                self.read_at = time.monotonic()
+                self.failing = False
             except Exception as err:
-                log(msg="region state unavailable", error=str(err))
+                if not self.failing:  # once, not every few seconds
+                    log(msg="platform parameter unavailable", name=self.name, error=str(err))
+                self.failing = True
+            self.read_at = time.monotonic()
         return self.value
 
 
+class Peers:
+    """Whether another region of the platform is out (ADR-013): in regions but not in active-regions.
+    Unknown counts as out: the standby copies are then processed here, and the idempotency table
+    skips what another region already did. A platform without active-regions is active/passive."""
+
+    def __init__(self, regions, active):
+        self.regions, self.active = regions, active
+
+    def out(self):
+        regions, active = self.regions.get(), self.active.get()
+        if "UNKNOWN" in (regions, active):
+            return True
+        return bool(set(regions.split(",")) - set(active.split(",")))
+
+
 class Worker:
-    def __init__(self, sqs, s3, sales, idempotency, state, queue_url, bucket, clock=time.time):
+    def __init__(self, sqs, s3, sales, idempotency, state, queue_url, bucket, standby_url=None, peers=None, clock=time.time):
         self.sqs, self.s3, self.sales, self.idempotency, self.state = sqs, s3, sales, idempotency, state
-        self.queue_url, self.bucket, self.clock = queue_url, bucket, clock
+        self.queue_url, self.bucket, self.standby_url, self.peers, self.clock = queue_url, bucket, standby_url, peers, clock
         self.stats = Counter()
 
     def handle(self, body):
@@ -99,32 +130,47 @@ class Worker:
         self.idempotency.put_item(Item={"id": sale_id, "processed_at": processed_at, "region": REGION, "expires_at": int(self.clock()) + IDEMPOTENCY_TTL})
         return outcome
 
+    def takes_standby(self):
+        """The standby copies are processed here only while another region is out."""
+        return bool(self.standby_url) and (self.peers is None or self.peers.out())
+
     def poll_once(self):
-        """One long poll (up to 20 s); only in the ACTIVE region. Returns the messages handled."""
+        """One round, only in an ACTIVE region: the standby copies first (no wait) when another
+        region is out, then the region's own queue (long poll, up to 20 s, unless the standby
+        queue had work). Returns the messages handled."""
         if self.state.get() != "ACTIVE":
             self.stats["passive_checks"] += 1
             return 0
-        messages = self.sqs.receive_message(QueueUrl=self.queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=20).get("Messages", [])
+        handled = 0
+        if self.takes_standby():
+            handled += self.consume(self.standby_url, wait=0, source="standby")
+        handled += self.consume(self.queue_url, wait=0 if handled else 20, source="own")
+        return handled
+
+    def consume(self, queue_url, wait, source):
+        messages = self.sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=wait).get("Messages", [])
         for msg in messages:
             try:
                 outcome = self.handle(msg["Body"])
             except Exception as err:
                 # Left in the queue: visible again after the visibility timeout, then the DLQ.
                 self.stats["errors"] += 1
-                log(msg="sale not processed", message_id=msg.get("MessageId"), error=str(err))
+                log(msg="sale not processed", message_id=msg.get("MessageId"), queue=source, error=str(err))
                 continue
-            self.sqs.delete_message(QueueUrl=self.queue_url, ReceiptHandle=msg["ReceiptHandle"])
+            self.sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
             self.stats[outcome] += 1
-            log(msg=f"sale {outcome}", message_id=msg.get("MessageId"))
+            self.stats[f"from_{source}"] += 1
+            log(msg=f"sale {outcome}", message_id=msg.get("MessageId"), queue=source)
         return len(messages)
 
     def run(self, stop):
-        last_state = None
+        last = None
         while not stop.is_set():
             state = self.state.get()
-            if state != last_state:
-                log(msg="region state", state=state, consuming=state == "ACTIVE")
-                last_state = state
+            now = (state, state == "ACTIVE" and self.takes_standby())
+            if now != last:
+                log(msg="region state", state=state, consuming=state == "ACTIVE", standby=now[1])
+                last = now
             if state != "ACTIVE":
                 stop.wait(PASSIVE_WAIT)
                 continue
@@ -146,7 +192,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             body, ctype = b"ok\n", "text/plain"
         elif self.path == "/info":
-            body = json.dumps({"service": "svc-sales-worker", "region": REGION, "region_state": WORKER.state.get(), "stats": dict(WORKER.stats)}, indent=2).encode()
+            body = json.dumps({
+                "service": "svc-sales-worker",
+                "region": REGION,
+                "region_state": WORKER.state.get(),
+                "takes_standby": WORKER.takes_standby(),
+                "stats": dict(WORKER.stats),
+            }, indent=2).encode()
             ctype = "application/json"
         else:
             body, ctype = b'{"error": "not found"}', "application/json"
@@ -167,14 +219,18 @@ def main():
 
     config = Config(connect_timeout=2, read_timeout=25, retries={"mode": "standard", "max_attempts": 3})
     dynamodb = boto3.resource("dynamodb", config=config)
+    ssm = boto3.client("ssm", config=config)
+    platform = os.environ["REGION_STATE_PARAMETER"].rsplit("/", 1)[0]  # /jonomait/<env>/platform
     WORKER = Worker(
         sqs=boto3.client("sqs", config=config),
         s3=boto3.client("s3", config=config),
         sales=dynamodb.Table(os.environ["TABLE_SALES"]),
         idempotency=dynamodb.Table(os.environ["TABLE_IDEMPOTENCY"]),
-        state=RegionState(boto3.client("ssm", config=config), os.environ["REGION_STATE_PARAMETER"]),
+        state=Parameter(ssm, os.environ["REGION_STATE_PARAMETER"]),
         queue_url=os.environ["QUEUE_SALES_PROCESSING"],
         bucket=os.environ["BUCKET_RECEIPTS"],
+        standby_url=os.environ.get("QUEUE_SALES_PROCESSING_STANDBY"),
+        peers=Peers(Parameter(ssm, f"{platform}/regions"), Parameter(ssm, f"{platform}/active-regions")),
     )
 
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
@@ -183,7 +239,7 @@ def main():
     # ECS stops a task with SIGTERM: finish the current batch, then exit.
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    log(msg="started", queue=WORKER.queue_url)
+    log(msg="started", queue=WORKER.queue_url, standby=WORKER.standby_url)
     WORKER.run(stop)
     server.shutdown()
     log(msg="stopped", stats=dict(WORKER.stats))

@@ -3,9 +3,12 @@
 
 queues = {
   sales-processing = {
-    # svc-sales-api's topic of EVERY region: each region's queue holds every sale, so the region that
-    # becomes ACTIVE after a failover already has the backlog.
+    # svc-sales-api's topic of EVERY region, so every region keeps a copy of every sale. standby
+    # splits it (ADR-013): this queue gets the sales created in its own region, and
+    # sales-processing-standby the copies from the other regions, consumed only while another
+    # region is out. After a failover the backlog is already here.
     subscribe          = ["svc-sales-api/sales-created"]
+    standby            = true
     visibility_timeout = 60 # longer than processing one batch
     max_receive_count  = 5  # then the dead-letter queue
   }
