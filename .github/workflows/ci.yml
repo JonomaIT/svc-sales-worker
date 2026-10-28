@@ -1,7 +1,10 @@
 name: CI
 
-# Logic lives in JonomaIT/pipelines. Pull request: build (the unit tests run inside the build) and
-# scan the image. main: also push it to the platform registry, tagged with the commit SHA.
+# Logic lives in JonomaIT/pipelines.
+#   pull request  build (the unit tests run inside the build) and scan the image
+#   main          also push it to the platform registry, tagged with the commit SHA, then deploy
+#   manual        Actions → CI → Run workflow: build (or reuse) the image of this commit and deploy
+#                 it; "destroy" removes the app from production instead (data last)
 on:
   pull_request:
     branches:
@@ -9,11 +12,32 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      destroy:
+        type: boolean
+        default: false
+        description: Remove the app from production (data last)
 
 permissions:
   contents: read
-  id-token: write # OIDC with AWS (push role, main only)
+  id-token: write # OIDC with AWS (registry push on main, deploy role in the production Environment)
 
 jobs:
   image:
-    uses: JonomaIT/pipelines/.github/workflows/build-push.yml@v2.2.0
+    if: ${{ !inputs.destroy }}
+    uses: JonomaIT/pipelines/.github/workflows/build-push.yml@v2.3.0
+
+  # Deploys on main when the AUTO_DEPLOY org variable is "true" (the lab is up), or on a manual run.
+  deploy:
+    needs: image
+    if: >-
+      !cancelled() && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' || vars.AUTO_DEPLOY == 'true') &&
+      (needs.image.result == 'success' || inputs.destroy)
+    uses: JonomaIT/pipelines/.github/workflows/deploy-app.yml@v2.3.0
+    with:
+      environment: production
+      destroy: ${{ inputs.destroy || false }}
+    secrets:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN_JONOMA }}
