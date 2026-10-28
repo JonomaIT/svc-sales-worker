@@ -36,7 +36,9 @@ Declared in [`deploy/data.hcl`](deploy/data.hcl) (ADR-011); the data runner buil
 
 ## Pipeline and deploy
 
-Same as `svc-sales-api` (`build-push`; tests run inside the image build; dependencies pinned with hashes). Deploy order: **svc-sales-api data → this app's data → this app in each region** (its queues subscribe to the API's topics, which must exist).
+Same as `svc-sales-api` (`build-push`; tests run inside the image build; dependencies pinned with hashes). Deploy order: **svc-sales-api data → this app's data → this app in each region** (its queues subscribe to the API's topics, which must exist): deploy `svc-sales-api` first.
+
+**The pipeline deploys** (`deploy-app` of `pipelines`): on `main` when the `AUTO_DEPLOY` org variable is `true` (the lab is up), or by hand in *Actions → CI → Run workflow* (`destroy` removes the app, data last). It runs, in the production GitHub Environment, this app's data and then the app in each region, with the image of the commit. By hand, the data step:
 
 ```bash
 cd pipelines/terraform-runner/data
