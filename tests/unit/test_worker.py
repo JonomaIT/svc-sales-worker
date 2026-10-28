@@ -158,5 +158,78 @@ class PeersOut(unittest.TestCase):
         self.assertFalse(worker.Peers(Fixed("us-east-1"), Fixed("us-east-1")).out())
 
 
+class HeartbeatTable:
+    def __init__(self, items=None):
+        self.items = dict(items or {})
+        self.puts = 0
+
+    def get_item(self, Key):  # noqa: N803
+        item = self.items.get(Key["region"])
+        return {"Item": item} if item else {}
+
+    def put_item(self, Item):  # noqa: N803
+        self.items[Item["region"]] = Item
+        self.puts += 1
+
+
+class Clock:
+    def __init__(self, now):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+class Heartbeat(unittest.TestCase):
+    """A stopped worker: the other region takes its copies by itself, and lets go when it is back."""
+
+    def setUp(self):
+        self.clock = Clock(10_000)
+        self.table = HeartbeatTable({"sa-east-1": {"region": "sa-east-1", "at": 10_000}})
+        self.heartbeats = worker.Heartbeats(self.table, "us-east-1", clock=self.clock)
+        self.peers = worker.Peers(Fixed("us-east-1,sa-east-1"), Fixed("us-east-1,sa-east-1"), self.heartbeats)
+
+    def test_a_beating_region_is_in(self):
+        self.clock.now += 59
+        self.assertEqual(self.peers.out_regions(), [])
+
+    def test_a_silent_region_is_out_and_back_when_it_beats_again(self):
+        self.clock.now += 61
+        self.assertEqual(self.peers.out_regions(), ["sa-east-1"])
+        self.table.put_item({"region": "sa-east-1", "at": self.clock.now})
+        self.assertEqual(self.peers.out_regions(), [])
+
+    def test_a_region_that_never_beat_is_out(self):
+        self.table.items.clear()
+        self.assertTrue(self.peers.out())
+
+    def test_heartbeats_unreadable_count_as_out(self):
+        class Broken:
+            def get_item(self, Key):  # noqa: N803
+                raise RuntimeError("throttled")
+        self.peers.heartbeats = worker.Heartbeats(Broken(), "us-east-1", clock=self.clock)
+        self.assertEqual(self.peers.out_regions(), ["UNKNOWN"])
+
+    def test_beats_at_most_every_15_seconds(self):
+        self.heartbeats.beat()
+        self.clock.now += 10
+        self.heartbeats.beat()
+        self.clock.now += 5
+        self.heartbeats.beat()
+        self.assertEqual((self.table.puts, self.table.items["us-east-1"]["at"]), (2, 10_015))
+
+    def test_only_an_active_worker_beats_and_a_stopped_peer_hands_over_its_copies(self):
+        w = make(standby=[json.dumps(OTHER)], active="us-east-1,sa-east-1")
+        w.peers = self.peers
+        self.clock.now += 120  # sa-east-1's worker stopped two minutes ago
+        self.assertEqual(w.poll_once(), 1, "the copy of the sale born in sa-east-1 is processed here")
+        self.assertIn("us-east-1", self.table.items)
+
+        passive = make(state="PASSIVE", active="us-east-1,sa-east-1")
+        passive.peers = worker.Peers(Fixed("us-east-1,sa-east-1"), Fixed("us-east-1"), worker.Heartbeats(HeartbeatTable(), "sa-east-1", clock=self.clock))
+        passive.poll_once()
+        self.assertEqual(passive.peers.heartbeats.table.puts, 0, "a PASSIVE worker does not consume, so it does not beat")
+
+
 if __name__ == "__main__":
     unittest.main()
