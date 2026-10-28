@@ -1,21 +1,28 @@
 # svc-sales-worker
 
-Sales processor of the JonomaIT lab: consumes the sales created by [`svc-sales-api`](https://github.com/JonomaIT/svc-sales-api) and processes them **only in the ACTIVE region** (ADR-012). Internal app: no public name, nothing on the ALB.
+Sales processor of the JonomaIT lab: consumes the sales created by [`svc-sales-api`](https://github.com/JonomaIT/svc-sales-api), in every ACTIVE region. Each region processes the sales born in it, and the copies of the other regions wait in a standby queue for a failover (ADR-012, ADR-013). Internal app: no public name, nothing on the ALB.
 
 ```
-SNS "sales-created" us-east-1 ──┬──► SQS "sales-processing" us-east-1 ──► worker us-east-1 (ACTIVE: consumes)
-SNS "sales-created" sa-east-1 ──┘                                          │  1. idempotency? (global table)
-         (both topics feed both queues)                                    │  2. receipt → S3 (replicated ⇄)
-                                ┌──► SQS "sales-processing" sa-east-1     │  3. sale PROCESSED (svc-sales-api's table)
-                                └─── worker sa-east-1 (PASSIVE: waits)     │  4. idempotency mark, delete message
+SNS "sales-created" us-east-1 ──┬──► SQS "sales-processing"         us-east-1 ──► worker us-east-1
+                                └──► SQS "sales-processing-standby" sa-east-1     │  1. idempotency? (global table)
+SNS "sales-created" sa-east-1 ──┬──► SQS "sales-processing"         sa-east-1 ──► worker sa-east-1
+                                └──► SQS "sales-processing-standby" us-east-1     │  2. receipt → S3 (replicated ⇄)
+                                                                                  │  3. sale PROCESSED (svc-sales-api's table)
+                                                                                  │  4. idempotency mark, delete message
 ```
+
+| Platform | What each worker consumes |
+|---|---|
+| **active/active** (both regions ACTIVE) | its own `sales-processing`: each sale is processed where it was created (`processed_region` = `created_region`) |
+| **active/passive** | the ACTIVE region: its own queue **and** its standby queue (everything); the PASSIVE region: nothing |
+| a region taken out of an active/active platform | the remaining ACTIVE region also takes its standby queue: the copies of the region that is out |
 
 ## Why it survives a region failure
 
-- **Every region's queue gets every sale** (each queue subscribes to the topic of every region). The PASSIVE region keeps its copy untouched for up to 4 days (`retention_days`).
-- **Failover**: the platform puts the other region first in `global/dns-cloudflare` (one PR): the load balancer and the region state flip together. The new ACTIVE worker processes its backlog; the **idempotency table** (global, replicated) skips what the old region already did. Nothing is lost, nothing is processed twice.
+- **Every region keeps a copy of every sale** (the queue of each region subscribes to the topic of every region; standby puts the other regions' copies in their own queue). Copies wait up to 4 days (`retention_days`).
+- **Failover**: the platform takes the region out in `global/dns-cloudflare` (one PR): the load balancer stops sending it traffic and `active-regions` drops it. The remaining worker then works through its standby queue; the **idempotency table** (global, replicated) skips what the region that went out already did. Nothing is lost, nothing is processed twice.
 - **Every step is safe to repeat**: a crash in the middle means a retry. A message that keeps failing goes to the **dead-letter queue** after 5 attempts (`sales-processing-dlq`).
-- If the region state cannot be read, the worker does **not** consume: two regions processing at once is the risk to avoid.
+- If the region state cannot be read, the worker does **not** consume: two regions processing at once is the risk to avoid. If `active-regions` cannot be read, it counts the other region as out and takes the standby copies too (the idempotency table skips duplicates).
 
 ## What the platform gives it
 
@@ -23,16 +30,17 @@ Declared in [`deploy/data.hcl`](deploy/data.hcl) (ADR-011); the data runner buil
 
 | Variable | Value |
 |---|---|
-| `QUEUE_SALES_PROCESSING` | its queue URL in the region, subscribed to `svc-sales-api/sales-created` of every region |
+| `QUEUE_SALES_PROCESSING` | its queue URL in the region: the sales created in this region |
+| `QUEUE_SALES_PROCESSING_STANDBY` | the standby queue URL in the region: the copies of the sales created in the other regions (`standby = true`) |
 | `TABLE_IDEMPOTENCY` | `jonomait-prd-svc-sales-worker-idempotency` (TTL `expires_at`, 7 days) |
 | `BUCKET_RECEIPTS` | `jonomait-prd-svc-sales-worker-receipts-<region>`, replicated both ways |
 | `TABLE_SALES` | svc-sales-api's table, declared in `uses` (read-write) |
-| `REGION_STATE_PARAMETER` | the region state (ADR-012) |
+| `REGION_STATE_PARAMETER` | the region state (ADR-012); `regions` and `active-regions` are read next to it (ADR-013) |
 
 | Endpoint | Answer |
 |---|---|
 | `GET /health` | `ok` |
-| `GET /info` | region, region state and counters (`processed`, `duplicate`, `gone`, `errors`, `passive_checks`) |
+| `GET /info` | region, region state, `takes_standby` and counters (`processed`, `duplicate`, `gone`, `errors`, `passive_checks`, `from_own`, `from_standby`) |
 
 ## Pipeline and deploy
 
