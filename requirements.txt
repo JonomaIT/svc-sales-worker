@@ -1,12 +1,12 @@
 # Generated from requirements.in with pip-compile --generate-hashes: every package pinned and
 # hash-checked (pip install --require-hashes). Dependabot keeps it current.
-boto3==1.43.116 \
-    --hash=sha256:89fa15e7d1788fb17cbd694b034beba57f43f30f58f4506913a5b62220f8ba01 \
-    --hash=sha256:9dca4dbd464b189041b27b5a02280bd5e02c3051bebf6bd03cd0e47aaf558030
+boto3==1.43.118 \
+    --hash=sha256:ab8f3d2c622ef039338b4f228d97ea55f1abd573d84bb9b9a5ee8cb6780c0ccd \
+    --hash=sha256:c0620f799e0f0c222ba42c337b65cdbcd3da38a3121187f634d8926cbbb28a9c
     # via -r requirements.in
-botocore==1.43.116 \
-    --hash=sha256:00b1fbfc1c024b56633538385628a1bbc7ab15aca0b5b53e5fe188841d96c8ce \
-    --hash=sha256:92f1efe8434183f08f91a61478925f5f8d23082024556f269f916477040e26f4
+botocore==1.43.120 \
+    --hash=sha256:7f54674f26f0d9a500bf44a1f858e88b70b03c82b2aca385ddf51f6e968bfd01 \
+    --hash=sha256:f479cbb7273b9c0ea589a91a7abe38badda6353fb7c237a22c7461a06d279ee2
     # via
     #   boto3
     #   s3transfer
