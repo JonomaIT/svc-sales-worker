@@ -9,11 +9,16 @@ queues (standby, ADR-013):
 
 It only consumes while its region is ACTIVE (ADR-012); a PASSIVE region leaves both queues alone.
 An ACTIVE region always consumes its own sales, and the standby copies only while another region of
-the platform is out (not in active-regions). So:
+the platform is out. A region is out when:
+  - the platform says so (missing from active-regions: active/passive, or taken out in active/active);
+  - or its worker stopped: every ACTIVE worker writes a heartbeat to a global table every 15 s, and a
+    region whose last heartbeat is older than 60 s (or that never wrote one) counts as out. When it
+    comes back, its heartbeat is fresh again and the others leave its copies alone. No PR needed.
+So:
 
   active/passive   the ACTIVE region processes everything (its own queue and the standby copies)
   active/active    each region processes what was born in it (processed_region = created_region);
-                   when one is taken out, the others work through its copies
+                   when one is taken out or its worker stops, the others work through its copies
 
 The idempotency table (global) skips what another region already did, so a failover never repeats
 a sale, and the copies kept in the queues mean nothing is lost while a region is down.
@@ -31,7 +36,7 @@ dead-letter queue after max_receive_count attempts.
   GET /info   -> region, region state, whether it takes the standby copies, and counters
 
 Everything arrives as environment variables: QUEUE_SALES_PROCESSING, QUEUE_SALES_PROCESSING_STANDBY
-(optional), TABLE_IDEMPOTENCY, BUCKET_RECEIPTS, TABLE_SALES (data runner, ADR-011),
+(optional), TABLE_IDEMPOTENCY, TABLE_HEARTBEATS (optional), BUCKET_RECEIPTS, TABLE_SALES (data runner, ADR-011),
 REGION_STATE_PARAMETER (platform; regions and active-regions are read next to it), AWS_REGION.
 """
 
@@ -48,6 +53,8 @@ PORT = int(os.environ.get("PORT", "8080"))
 REGION = os.environ.get("AWS_REGION", "unknown")
 PASSIVE_WAIT = 15  # seconds between region state checks while PASSIVE
 IDEMPOTENCY_TTL = 7 * 86400
+HEARTBEAT_EVERY = 15  # seconds between heartbeats of an ACTIVE worker
+HEARTBEAT_STALE = 60  # a region without a heartbeat for this long counts as out
 
 
 def log(**fields):
@@ -80,19 +87,60 @@ class Parameter:
         return self.value
 
 
+class Heartbeats:
+    """Whether the worker of each region is consuming: every ACTIVE worker writes its region and the
+    time to a global table (at most every HEARTBEAT_EVERY seconds); a region whose last heartbeat is
+    older than HEARTBEAT_STALE, or that never wrote one, has stopped. The time is each task's clock
+    (NTP-synced on AWS); entries expire after a day."""
+
+    def __init__(self, table, region, clock=time.time, every=HEARTBEAT_EVERY, stale=HEARTBEAT_STALE):
+        self.table, self.region, self.clock, self.every, self.stale_after = table, region, clock, every, stale
+        self.last_beat = None
+
+    def beat(self):
+        now = self.clock()
+        if self.last_beat is None or now - self.last_beat >= self.every:
+            self.table.put_item(Item={"region": self.region, "at": int(now), "expires_at": int(now) + 86400})
+            self.last_beat = now
+
+    def stale(self, regions):
+        """The regions, other than this one, whose worker stopped."""
+        now = self.clock()
+        stopped = []
+        for region in regions:
+            if region == self.region:
+                continue
+            item = self.table.get_item(Key={"region": region}).get("Item")
+            if not item or now - int(item["at"]) > self.stale_after:
+                stopped.append(region)
+        return stopped
+
+
 class Peers:
-    """Whether another region of the platform is out (ADR-013): in regions but not in active-regions.
-    Unknown counts as out: the standby copies are then processed here, and the idempotency table
-    skips what another region already did. A platform without active-regions is active/passive."""
+    """The regions out (ADR-013): missing from active-regions (the platform), or whose worker stopped
+    (heartbeats). Unknown counts as out: the standby copies are then processed here, and the
+    idempotency table skips what another region already did. A platform without active-regions is
+    active/passive."""
 
-    def __init__(self, regions, active):
-        self.regions, self.active = regions, active
+    def __init__(self, regions, active, heartbeats=None):
+        self.regions, self.active, self.heartbeats = regions, active, heartbeats
 
-    def out(self):
+    def out_regions(self):
         regions, active = self.regions.get(), self.active.get()
         if "UNKNOWN" in (regions, active):
-            return True
-        return bool(set(regions.split(",")) - set(active.split(",")))
+            return ["UNKNOWN"]
+        regions = [r for r in regions.split(",") if r]
+        out = sorted(set(regions) - set(active.split(",")))
+        if self.heartbeats is not None:
+            try:
+                out += [r for r in self.heartbeats.stale(regions) if r not in out]
+            except Exception as err:
+                log(msg="heartbeats unavailable", error=str(err))
+                out.append("UNKNOWN")
+        return out
+
+    def out(self):
+        return bool(self.out_regions())
 
 
 class Worker:
@@ -141,6 +189,8 @@ class Worker:
         if self.state.get() != "ACTIVE":
             self.stats["passive_checks"] += 1
             return 0
+        if self.peers is not None and self.peers.heartbeats is not None:
+            self.peers.heartbeats.beat()  # "this region is consuming its queue"
         handled = 0
         if self.takes_standby():
             handled += self.consume(self.standby_url, wait=0, source="standby")
@@ -197,6 +247,7 @@ class Handler(BaseHTTPRequestHandler):
                 "region": REGION,
                 "region_state": WORKER.state.get(),
                 "takes_standby": WORKER.takes_standby(),
+                "regions_out": WORKER.peers.out_regions() if WORKER.peers else [],
                 "stats": dict(WORKER.stats),
             }, indent=2).encode()
             ctype = "application/json"
@@ -230,7 +281,11 @@ def main():
         queue_url=os.environ["QUEUE_SALES_PROCESSING"],
         bucket=os.environ["BUCKET_RECEIPTS"],
         standby_url=os.environ.get("QUEUE_SALES_PROCESSING_STANDBY"),
-        peers=Peers(Parameter(ssm, f"{platform}/regions"), Parameter(ssm, f"{platform}/active-regions")),
+        peers=Peers(
+            Parameter(ssm, f"{platform}/regions"),
+            Parameter(ssm, f"{platform}/active-regions"),
+            Heartbeats(dynamodb.Table(os.environ["TABLE_HEARTBEATS"]), REGION) if os.environ.get("TABLE_HEARTBEATS") else None,
+        ),
     )
 
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)

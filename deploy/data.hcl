@@ -17,6 +17,10 @@ queues = {
 tables = {
   # Sales already processed, by any region (global table); entries expire after 7 days.
   idempotency = { hash_key = "id", ttl_attribute = "expires_at" }
+
+  # Last heartbeat of the worker of each region (global table): a region silent for 60 s counts as
+  # out, and the others take its standby copies without waiting for a PR (ADR-013).
+  heartbeats = { hash_key = "region", ttl_attribute = "expires_at" }
 }
 
 buckets = {
