@@ -26,7 +26,7 @@ permissions:
 jobs:
   image:
     if: ${{ !inputs.destroy }}
-    uses: JonomaIT/pipelines/.github/workflows/build-push.yml@v2.3.0
+    uses: JonomaIT/pipelines/.github/workflows/build-push.yml@v2.3.1
 
   # Deploys on main when the AUTO_DEPLOY org variable is "true" (the lab is up), or on a manual run.
   deploy:
@@ -35,7 +35,7 @@ jobs:
       !cancelled() && github.ref == 'refs/heads/main' &&
       (github.event_name == 'workflow_dispatch' || vars.AUTO_DEPLOY == 'true') &&
       (needs.image.result == 'success' || inputs.destroy)
-    uses: JonomaIT/pipelines/.github/workflows/deploy-app.yml@v2.3.0
+    uses: JonomaIT/pipelines/.github/workflows/deploy-app.yml@v2.3.1
     with:
       environment: production
       destroy: ${{ inputs.destroy || false }}
