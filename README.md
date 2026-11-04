@@ -52,7 +52,7 @@ Same as `svc-sales-api` (`build-push`; tests run inside the image build; depende
 
 ```bash
 cd pipelines/terraform-runner/data
-terraform init -backend-config=../../../organization/backends/production.tfbackend -backend-config=key=production/cross-region/data/svc-sales-worker
+terraform init -backend-config=bucket=jonomait-production-tfstate -backend-config=region=us-east-1 -backend-config=key=production/cross-region/data/svc-sales-worker
 terraform apply -var-file=../../../svc-sales-worker/deploy/data.hcl \
   -var environment=production -var name=svc-sales-worker -var 'regions=["us-east-1","sa-east-1"]'
 ```
