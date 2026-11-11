@@ -35,7 +35,7 @@ jobs:
       !cancelled() && github.ref == 'refs/heads/main' &&
       (github.event_name == 'workflow_dispatch' || vars.AUTO_DEPLOY == 'true') &&
       (needs.image.result == 'success' || inputs.destroy)
-    uses: JonomaIT/pipelines/.github/workflows/deploy-app.yml@v2.4.1
+    uses: JonomaIT/pipelines/.github/workflows/deploy-app.yml@v2.7.1
     with:
       environment: production
       destroy: ${{ inputs.destroy || false }}
