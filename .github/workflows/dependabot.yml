@@ -1,0 +1,18 @@
+name: Dependabot
+
+# Patch and minor updates merge themselves when CI passes; a major waits with the label
+# dependabot:manual. Logic in JonomaIT/pipelines (dependabot-auto-merge).
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  dependabot:
+    if: github.actor == 'dependabot[bot]'
+    uses: JonomaIT/pipelines/.github/workflows/dependabot-auto-merge.yml@v2.12.0
+    secrets:
+      RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
