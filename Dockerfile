@@ -19,6 +19,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/deps \
     PORT=8080
 
+# Debian security fixes reach apt before a rebuilt python:*-slim image ships them; applying them at
+# build keeps the image scan green between upstream rebuilds (e.g. CVE-2026-124851 in libzstd1).
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
 # The app never installs anything at runtime: pip (and what it bundles) only adds attack surface.
 RUN python -m pip uninstall -y pip setuptools wheel >/dev/null 2>&1; \
     rm -rf /usr/local/lib/python3*/site-packages/pip* /usr/local/lib/python3*/site-packages/setuptools* \
