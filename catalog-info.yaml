@@ -1,0 +1,15 @@
+# Software catalog entry (Backstage format). It is the source of truth for what this repo is,
+# who owns it and how it runs; a portal or a script can read every repo's file.
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: svc-sales-worker
+  description: "Reference app: sales processor on ECS, consuming in every ACTIVE region."
+  annotations:
+    github.com/project-slug: JonomaIT/svc-sales-worker
+  tags: [ecs,python,reference]
+spec:
+  type: service
+  lifecycle: experimental
+  owner: group:jonomait/gh-dev-vendas
+  system: sales
